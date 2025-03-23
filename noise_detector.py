@@ -59,7 +59,7 @@ def parse_reply(reply):
     for i in range(num_valid_bytes // 2):  # Each data area is 2 bytes
         start_idx = 3 + i * 2
         data_areas.append(reply[start_idx + 1])
-        data_areas.append(reply[start_idx] << 8)
+        data_areas.append(reply[start_idx])
             
     # Extract and validate the checksum
     received_crc_low = reply[-2]
@@ -78,13 +78,8 @@ def parse_reply(reply):
     print("Number of Valid Bytes:", num_valid_bytes)
     print("Data Areas:", [hex(data) for data in data_areas])
         
-    return {
-        "address_code": address_code,
-        "function_code": function_code,
-        "num_valid_bytes": num_valid_bytes,
-        "data_areas": data_areas,
-        "checksum": (received_crc_low, received_crc_high)
-        }
+    return data_areas
+
 
 try:
     serial = Serial(port=port,
@@ -93,7 +88,10 @@ try:
                     parity=PARITY_NONE,
                     stopbits=STOPBITS_ONE,
                     timeout=serial_timeout)
-    full_message = send_message(0xFF, 0x03, [0x07, 0xD0], [0x00, 0x02])
+    # read the address and baud rate of the device
+    #full_message = send_message(0xFF, 0x03, [0x07, 0xD0], [0x00, 0x02])
+    #read noise level
+    full_message = send_message(0x01, 0x03, [0x00, 0x00], [0x00, 0x01])
     serial.write(full_message)
 except SerialException as exp:
       print(str(exp))
@@ -101,9 +99,14 @@ except SerialException as exp:
 try:
     while True:
         if serial.in_waiting > 0:
-            data = serial.read(256)
-            print("Received data len: ", len(data))
-            parse_reply(data)
+            reply = serial.read(256)
+            data = parse_reply(reply)
+            #baud_rate_index = data[1] << 8 | data[0]
+            #device_address = data[3] << 8 | data[2]
+            #print("Baud Rate Index:", baud_rate_index)
+            #print("Device Address:", device_address)
+            noise_level = float(data[1] << 8 | data[0]) / 10
+            print("Noise Level:", noise_level, "dB")
             break
         time.sleep(0.1)  # Short delay to prevent CPU overuse
 except KeyboardInterrupt:
