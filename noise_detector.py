@@ -10,6 +10,7 @@ class NoiseDetector:
     DEFAULT_BAUD_RATE = 9600
     SERIAL_TIMEOUT = 2
     MAXIMUM_MESSAGE_LENGTH = 256
+    AVAILABLE_BAUD_RATES = (2400, 4800, 9600)
 
     def __init__(self, serial_port=DEFAULT_SERIAL_PORT, baud_rate=DEFAULT_BAUD_RATE):
         self.logger = logging.getLogger("NoiseDetector")
@@ -108,6 +109,11 @@ class NoiseDetector:
         self.logger.debug(f"Noise Level: {noise_level} dB")
         return noise_level
 
+    def _get_baud_rate(self, index):
+        if 0 <= index < len(self.AVAILABLE_BAUD_RATES):  # Bound checking
+            return self.AVAILABLE_BAUD_RATES[index]
+        return None
+
     def read_device_info(self):
         message = self._get_message(0xFF, 0x03, [0x07, 0xD0], [0x00, 0x02])
         try:
@@ -117,14 +123,14 @@ class NoiseDetector:
             self.logger.error(str(exp))
             return None
         data = self._parse_reply(reply)
-        baud_rate_index = data[1] << 8 | data[0]
-        device_address = data[3] << 8 | data[2]
+        device_address = data[1] << 8 | data[0] # the documentation says the baud rate address is in the first two bytes, but it is actually in the last two bytes
+        baud_rate_index = data[3] << 8 | data[2]
         self.logger.debug(f"Baud Rate Index: {baud_rate_index}")
         self.logger.debug(f"Device Address: {device_address}")
-        return baud_rate_index, device_address
+        return self._get_baud_rate(baud_rate_index), device_address
 
 if __name__ == "__main__":
-    logging.basicConfig(level=logging.WARNING)
+    logging.basicConfig(level=logging.INFO)
     detector = NoiseDetector()
     noise_level = detector.read_noise_level()
     if noise_level is not None:
