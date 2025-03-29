@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 
 from serial import Serial, SerialException, EIGHTBITS, PARITY_NONE, STOPBITS_ONE
-import time
 import logging
 
 
