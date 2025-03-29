@@ -100,6 +100,7 @@ class NoiseDetector:
         message = self._get_message(0x01, 0x03, [0x00, 0x00], [0x00, 0x01])
         try:
             self._serial.write(message)
+            self._serial.flush()
             reply = self._serial.read(self.MAXIMUM_MESSAGE_LENGTH)
         except SerialException as exp:
             self.logger.error(str(exp))
@@ -118,6 +119,7 @@ class NoiseDetector:
         message = self._get_message(0xFF, 0x03, [0x07, 0xD0], [0x00, 0x02])
         try:
             self._serial.write(message)
+            self._serial.flush()
             reply = self._serial.read(self.MAXIMUM_MESSAGE_LENGTH)
         except SerialException as exp:
             self.logger.error(str(exp))
