@@ -5,7 +5,6 @@ import math, time, queue, threading
 import numpy as np, pyaudio, speech_recognition as sr
 from collections import deque
 from contextlib import contextmanager
-from reset_respeaker import reset_respeaker_lite
 from datetime import datetime, timezone
 import logging
 
@@ -98,7 +97,6 @@ class NoiseDetector:
 
     # ── main ──
     def run(self):
-        reset_respeaker_lite()
         with pyaudio_stream(format=pyaudio.paInt16, channels=self.CH,
                             rate=self.SR, input=True, frames_per_buffer=self.CHUNK,
                             input_device_index=self.dev) as self.stream:

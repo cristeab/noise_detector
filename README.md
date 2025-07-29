@@ -1,4 +1,4 @@
 # Noise Detector
-Noise detection based on PR-ZS-BZ-* noise module. The PR-ZS-BZ noise module is a professional-grade sound level meter that measures noise between 30 dB and 120 dB.
+Noise detection based on Seeed Respeaker Lite
 
 An usage example can be found [here](https://github.com/cristeab/aq_dashboard).
