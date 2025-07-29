@@ -52,8 +52,12 @@ class NoiseDetector:
     HYST_DB         = 3
     EMA_α           = 0.3
 
-    def __init__(self, mic="ReSpeaker"):
-        self.logger = logging.getLogger("NoiseDetector")
+    def __init__(self, logger=None, mic="ReSpeaker"):
+        if logger is None:
+            logging.basicConfig(level=logging.INFO)
+            self.logger = logging.getLogger("NoiseDetector")
+        else:
+            self.logger = logger
         self.dev = self._find_mic(mic)
         self.rec = sr.Recognizer()
         self.nL = deque(maxlen=self.WIN_LEN)
@@ -140,10 +144,10 @@ class NoiseDetector:
                         self.noise_callback(timestamp, db_both)
 
                     local_time = timestamp.astimezone().strftime('%d/%m/%Y, %H:%M:%S')
-                    self.logger.info(f"Timestamp: {local_time}, "
+                    print(f"Timestamp: {local_time}, "
                         f"Noise level: L {db_nL:6.2f} dBFS, "
                         f"R {db_nR:6.2f} dBFS, "
-                        f"Avg {db_both:6.2f} dBFS")
+                        f"Avg {db_both:6.2f} dBFS", flush=True)
                 # (optional failsafe: also fire if >NOISE_TRACK_SEC wall-clock seconds
                 # have elapsed even though buf is shorter – protects against dropouts)
                 if time.time() - last_noise_print > self.NOISE_TRACK_SEC * 1.2:
@@ -180,5 +184,4 @@ class NoiseDetector:
 
 # ── entrypoint ──
 if __name__ == "__main__":
-    logging.basicConfig(level=logging.INFO)
     NoiseDetector().run()
