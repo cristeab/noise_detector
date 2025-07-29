@@ -63,6 +63,11 @@ class NoiseDetector:
         self.sel = 0; self.pending = False
         self.q = queue.Queue(maxsize=50)          # ↑ queue depth
         self.stream = None
+        self.noise_callback = None
+
+    def set_noise_callback(self, callback):
+        """Set a callback to be called with (datetime, avg_noise_level) after each noise estimation."""
+        self.noise_callback = callback
 
     # ── device ──
     def _find_mic(self, tag):
@@ -93,6 +98,7 @@ class NoiseDetector:
 
     # ── main ──
     def run(self):
+        reset_respeaker_lite()
         with pyaudio_stream(format=pyaudio.paInt16, channels=self.CH,
                             rate=self.SR, input=True, frames_per_buffer=self.CHUNK,
                             input_device_index=self.dev) as self.stream:
@@ -132,6 +138,9 @@ class NoiseDetector:
                     db_both = (db_nL + db_nR) / 2
 
                     timestamp = datetime.now(timezone.utc)
+                    if self.noise_callback:
+                        self.noise_callback(timestamp, db_both)
+
                     local_time = timestamp.astimezone().strftime('%d/%m/%Y, %H:%M:%S')
                     self.logger.info(f"Timestamp: {local_time}, "
                         f"Noise level: L {db_nL:6.2f} dBFS, "
@@ -174,5 +183,4 @@ class NoiseDetector:
 # ── entrypoint ──
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO)
-    reset_respeaker_lite()
     NoiseDetector().run()
