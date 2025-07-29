@@ -6,6 +6,7 @@ import numpy as np, pyaudio, speech_recognition as sr
 from collections import deque
 from contextlib import contextmanager
 from reset_respeaker import reset_respeaker_lite
+from datetime import datetime, timezone
 import logging
 
 
@@ -41,7 +42,7 @@ def pyaudio_stream(**kw):
             p.terminate()
 
 # ───── Core recogniser ────────────────────────────────────────────────── #
-class StereoVoiceRecognizer:
+class NoiseDetector:
     SR              = 16_000
     CHUNK           = 1_024          # 64 ms
     CH               = 2
@@ -129,10 +130,13 @@ class StereoVoiceRecognizer:
                     db_nL  = rms_to_db(n_estL, self.refL)
                     db_nR  = rms_to_db(n_estR, self.refR)
                     db_both = (db_nL + db_nR) / 2
-                    self.logger.info(f"[{time.strftime('%H:%M:%S')}] "
-                        f"Noise L {db_nL:6.2f} dBFS | "
-                        f"R {db_nR:6.2f} dBFS | "
-                        f"Avg {db_both:6.2f} dBFS |")
+
+                    timestamp = datetime.now(timezone.utc)
+                    local_time = timestamp.astimezone().strftime('%d/%m/%Y, %H:%M:%S')
+                    self.logger.info(f"Timestamp: {local_time}, "
+                        f"Noise level: L {db_nL:6.2f} dBFS, "
+                        f"R {db_nR:6.2f} dBFS, "
+                        f"Avg {db_both:6.2f} dBFS")
                 # (optional failsafe: also fire if >NOISE_TRACK_SEC wall-clock seconds
                 # have elapsed even though buf is shorter – protects against dropouts)
                 if time.time() - last_noise_print > self.NOISE_TRACK_SEC * 1.2:
@@ -171,4 +175,4 @@ class StereoVoiceRecognizer:
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO)
     reset_respeaker_lite()
-    StereoVoiceRecognizer().run()
+    NoiseDetector().run()
