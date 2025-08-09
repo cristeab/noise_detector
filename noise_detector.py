@@ -10,25 +10,6 @@ import scipy.signal as signal
 import logging
 
 
-# ───── Utility helpers ────────────────────────────────────────────────── #
-def rms_to_db(rms: float, ref: float) -> float:
-    return -float("inf") if rms <= 0 else 20 * math.log10(rms / ref)
-
-def ema(series: deque, α: float = 0.3) -> float:
-    y = series[0]
-    for x in list(series)[1:]:
-        y = α * x + (1 - α) * y
-    return y
-
-def clipped_mean(series: deque, lo=10, hi=90) -> float:
-    a = np.asarray(series)
-    low, high = np.percentile(a, [lo, hi])
-    clipped = a[(a >= low) & (a <= high)]
-    return float(np.mean(clipped)) if clipped.size else float(np.mean(a))
-
-def speech_gate(rms_db, noise_db, margin_db=10) -> bool:
-    return rms_db > noise_db + margin_db
-
 @contextmanager
 def pyaudio_stream(**kw):
     p = pyaudio.PyAudio()
@@ -160,7 +141,7 @@ class NoiseDetector:
 
                     local_time = timestamp.astimezone().strftime('%d/%m/%Y, %H:%M:%S')
                     print(f"Timestamp: {local_time}, "
-                        f"A-weighted ambient noise level: L {db_spl:.2f} dB SPL", flush=True)
+                        f"A-weighted ambient noise level: {db_spl:.2f} dB SPL", flush=True)
                 # (optional failsafe: also fire if >NOISE_TRACK_SEC wall-clock seconds
                 # have elapsed even though buf is shorter – protects against dropouts)
                 if time.time() - last_noise_print > self.NOISE_TRACK_SEC * 1.2:
