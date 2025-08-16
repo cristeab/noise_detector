@@ -45,10 +45,15 @@ class NoiseDetector:
         self.q = queue.Queue(maxsize=50)          # ↑ queue depth
         self.stream = None
         self.noise_callback = None
+        self.stt_callback = None
 
     def set_noise_callback(self, callback):
         """Set a callback to be called with (datetime, avg_noise_level) after each noise estimation."""
         self.noise_callback = callback
+
+    def set_stt_callback(self, callback):
+        """Set a callback to be called with (datetime, text) after each speech-to-text conversion."""
+        self.stt_callback = callback
 
     # A-weighting filter design for 16 kHz sampling rate
     @staticmethod
@@ -160,7 +165,10 @@ class NoiseDetector:
                     try:
                         txt = self.rec.recognize_google(sr.AudioData(mono, self.SR, 2),
                                                         language="ro-RO")
-                        self.logger.info(f"▶STT: {txt}")
+                        if self.stt_callback:
+                            self.stt_callback(txt)
+                        else:
+                            self.logger.info(f"▶STT: {txt}")
                     except sr.UnknownValueError:
                         pass
                     except sr.RequestError as e:
