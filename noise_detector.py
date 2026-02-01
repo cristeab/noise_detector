@@ -34,7 +34,7 @@ class NoiseDetector:
     # Calibration parameters
     CALIBRATION_WINDOW = 30  # seconds to collect baseline noise
     MIN_DB_SPL = 20.0        # Target minimum dB SPL for silence
-    PERCENTILE_FOR_SILENCE = 5  # Use 5th percentile as "silence" reference
+    PERCENTILE_FOR_SILENCE = 10  # Use 10th percentile as "silence" reference
 
     def __init__(self, logger=None, mic="ReSpeaker", auto_calibrate=True):
         if logger is None:
@@ -55,6 +55,9 @@ class NoiseDetector:
         self.is_calibrated = False
         self.calibration_samples = []
         self.calibration_complete = False
+
+        # Filter state for A-weighting (CRITICAL FIX)
+        self.filter_zi = None
 
     def set_noise_callback(self, callback):
         """Set a callback to be called with (datetime, avg_noise_level) after each noise estimation."""
@@ -106,6 +109,8 @@ class NoiseDetector:
         """
         Compute RMS and dB level from audio data.
         Returns raw dB value (before calibration offset).
+
+        Properly handle filter state to avoid artifacts
         """
         # Normalize 16-bit signed int to float32 [-1, 1]
         audio_normalized = audio_data.astype(np.float32) / 32768.0
@@ -113,26 +118,27 @@ class NoiseDetector:
         # Average the two channels to mono (ambient noise)
         mono_audio = np.mean(audio_normalized, axis=1)
 
-        # Apply A-weighting filter
-        weighted_frame = signal.lfilter(b, a, mono_audio)
+        # Apply A-weighting filter with proper state handling
+        # CRITICAL: Use lfilter with zi (filter state) to maintain continuity
+        if self.filter_zi is None:
+            # Initialize filter state
+            self.filter_zi = signal.lfilter_zi(b, a) * mono_audio[0]
+
+        weighted_frame, self.filter_zi = signal.lfilter(b, a, mono_audio, zi=self.filter_zi)
 
         # Compute RMS of weighted frame
         rms = np.sqrt(np.mean(weighted_frame**2))
         
         # Add noise floor to prevent log(0)
-        # The noise floor represents the minimum detectable signal
         noise_floor = 1e-10
         rms = max(rms, noise_floor)
 
         # Convert to dB relative to normalized full scale (dBFS)
-        # For normalized audio [-1, 1], 0 dBFS = RMS of 1.0
         db_fs = 20 * np.log10(rms)
         
         # Convert from dBFS to approximate dB SPL
-        # This assumes a reference mapping that will be calibrated
-        # Typical conversions place 0 dBFS around 94-120 dB SPL depending on setup
-        # We'll use a nominal conversion and then calibrate
-        db_spl_raw = db_fs + 94  # Nominal reference (will be adjusted by calibration)
+        # This nominal offset will be calibrated
+        db_spl_raw = db_fs + 94
         
         return db_spl_raw
 
@@ -147,17 +153,33 @@ class NoiseDetector:
             self.is_calibrated = True
             return
 
-        # Use the 5th percentile as the "silence" reference level
-        # This filters out occasional noise spikes during calibration
+        # Use the 10th percentile as the "silence" reference level
         silence_level = np.percentile(self.calibration_samples, self.PERCENTILE_FOR_SILENCE)
         
         # Calculate offset to map silence to MIN_DB_SPL (20 dB)
         self.calibration_offset = self.MIN_DB_SPL - silence_level
         
-        self.logger.info(f"Calibration complete: silence={silence_level:.2f} dB, "
-                        f"offset={self.calibration_offset:.2f} dB")
-        self.logger.info(f"Calibrated range: {np.min(self.calibration_samples) + self.calibration_offset:.2f} - "
-                        f"{np.max(self.calibration_samples) + self.calibration_offset:.2f} dB SPL")
+        # Show statistics
+        min_raw = np.min(self.calibration_samples)
+        max_raw = np.max(self.calibration_samples)
+        mean_raw = np.mean(self.calibration_samples)
+        std_raw = np.std(self.calibration_samples)
+
+        self.logger.info(f"Calibration complete:")
+        self.logger.info(f"  Raw calibration stats: min={min_raw:.2f}, max={max_raw:.2f}, "
+                        f"mean={mean_raw:.2f}, std={std_raw:.2f} dB")
+        self.logger.info(f"  Silence reference (p{self.PERCENTILE_FOR_SILENCE})={silence_level:.2f} dB (raw)")
+        self.logger.info(f"  Calibration offset={self.calibration_offset:.2f} dB")
+        self.logger.info(f"  Expected calibrated range: {min_raw + self.calibration_offset:.2f} - "
+                        f"{max_raw + self.calibration_offset:.2f} dB SPL")
+
+        # Sanity check: warn if calibration seems wrong
+        if std_raw > 5.0:
+            self.logger.warning(f"High variance ({std_raw:.2f} dB) during calibration - "
+                              "environment may not have been quiet enough!")
+        if max_raw - min_raw > 15.0:
+            self.logger.warning(f"Large range ({max_raw - min_raw:.2f} dB) during calibration - "
+                              "consider recalibrating in quieter conditions")
         
         self.is_calibrated = True
         self.calibration_complete = True
@@ -181,8 +203,8 @@ class NoiseDetector:
             max_calibration_samples = int(self.CALIBRATION_WINDOW / self.NOISE_TRACK_SEC)
             
             if self.auto_calibrate:
-                self.logger.info(f"Starting {self.CALIBRATION_WINDOW}s calibration period. "
-                               "Please ensure the environment is relatively quiet...")
+                self.logger.info(f"Starting {self.CALIBRATION_WINDOW}s calibration period.")
+                self.logger.info("IMPORTANT: Ensure the environment is QUIET - no music, talking, or other noise!")
             else:
                 self.is_calibrated = True
                 self.calibration_complete = True
@@ -225,16 +247,14 @@ class NoiseDetector:
                     # Apply calibration offset
                     db_spl = db_spl_raw + self.calibration_offset
                     
-                    # Ensure minimum bound
-                    db_spl = max(db_spl, self.MIN_DB_SPL)
-                    
                     timestamp = datetime.now(timezone.utc)
                     if self.noise_callback:
                         self.noise_callback(timestamp, db_spl)
 
                     local_time = timestamp.astimezone().strftime('%d/%m/%Y, %H:%M:%S')
                     print(f"Timestamp: {local_time}, "
-                          f"A-weighted ambient noise level: {db_spl:.2f} dB SPL", flush=True)
+                          f"Raw: {db_spl_raw:.2f} dB, "
+                          f"Calibrated: {db_spl:.2f} dB SPL", flush=True)
                     
                     last_noise_print = time.time()
                 
