@@ -30,10 +30,13 @@ class NoiseDetector:
     NOISE_TRACK_SEC = 3
     STT_WINDOW_SEC  = 5
     HYST_DB         = 3
-    # Reference pressure in Pascal
-    P0 = 20e-6
+    
+    # Calibration parameters
+    CALIBRATION_WINDOW = 30  # seconds to collect baseline noise
+    MIN_DB_SPL = 20.0        # Target minimum dB SPL for silence
+    PERCENTILE_FOR_SILENCE = 5  # Use 5th percentile as "silence" reference
 
-    def __init__(self, logger=None, mic="ReSpeaker"):
+    def __init__(self, logger=None, mic="ReSpeaker", auto_calibrate=True):
         if logger is None:
             logging.basicConfig(level=logging.INFO)
             self.logger = logging.getLogger("NoiseDetector")
@@ -42,10 +45,16 @@ class NoiseDetector:
         self.dev = self._find_mic(mic)
         self.rec = sr.Recognizer()
         self.sel = 0
-        self.q = queue.Queue(maxsize=50)          # ↑ queue depth
+        self.q = queue.Queue(maxsize=50)
         self.stream = None
         self.noise_callback = None
-        self.stt_callback = None
+        
+        # Calibration state
+        self.auto_calibrate = auto_calibrate
+        self.calibration_offset = 0.0  # dB offset to apply
+        self.is_calibrated = False
+        self.calibration_samples = []
+        self.calibration_complete = False
 
     def set_noise_callback(self, callback):
         """Set a callback to be called with (datetime, avg_noise_level) after each noise estimation."""
@@ -93,10 +102,71 @@ class NoiseDetector:
         while True:
             self.q.put(self.stream.read(self.CHUNK, exception_on_overflow=False))
 
+    def _compute_rms_db(self, audio_data, b, a):
+        """
+        Compute RMS and dB level from audio data.
+        Returns raw dB value (before calibration offset).
+        """
+        # Normalize 16-bit signed int to float32 [-1, 1]
+        audio_normalized = audio_data.astype(np.float32) / 32768.0
+
+        # Average the two channels to mono (ambient noise)
+        mono_audio = np.mean(audio_normalized, axis=1)
+
+        # Apply A-weighting filter
+        weighted_frame = signal.lfilter(b, a, mono_audio)
+
+        # Compute RMS of weighted frame
+        rms = np.sqrt(np.mean(weighted_frame**2))
+        
+        # Add noise floor to prevent log(0)
+        # The noise floor represents the minimum detectable signal
+        noise_floor = 1e-10
+        rms = max(rms, noise_floor)
+
+        # Convert to dB relative to normalized full scale (dBFS)
+        # For normalized audio [-1, 1], 0 dBFS = RMS of 1.0
+        db_fs = 20 * np.log10(rms)
+        
+        # Convert from dBFS to approximate dB SPL
+        # This assumes a reference mapping that will be calibrated
+        # Typical conversions place 0 dBFS around 94-120 dB SPL depending on setup
+        # We'll use a nominal conversion and then calibrate
+        db_spl_raw = db_fs + 94  # Nominal reference (will be adjusted by calibration)
+        
+        return db_spl_raw
+
+    def _calibrate(self):
+        """
+        Perform automatic calibration based on collected samples.
+        Assumes the quietest periods represent ambient silence.
+        """
+        if len(self.calibration_samples) < 5:
+            self.logger.warning("Not enough calibration samples, using default offset")
+            self.calibration_offset = 0.0
+            self.is_calibrated = True
+            return
+
+        # Use the 5th percentile as the "silence" reference level
+        # This filters out occasional noise spikes during calibration
+        silence_level = np.percentile(self.calibration_samples, self.PERCENTILE_FOR_SILENCE)
+        
+        # Calculate offset to map silence to MIN_DB_SPL (20 dB)
+        self.calibration_offset = self.MIN_DB_SPL - silence_level
+        
+        self.logger.info(f"Calibration complete: silence={silence_level:.2f} dB, "
+                        f"offset={self.calibration_offset:.2f} dB")
+        self.logger.info(f"Calibrated range: {np.min(self.calibration_samples) + self.calibration_offset:.2f} - "
+                        f"{np.max(self.calibration_samples) + self.calibration_offset:.2f} dB SPL")
+        
+        self.is_calibrated = True
+        self.calibration_complete = True
+
     # ── main ──
     def run(self):
         # Get A-weighting filter coefficients
         b, a = NoiseDetector.a_weighting(self.SR)
+        
         with pyaudio_stream(format=pyaudio.paInt16, channels=self.CH,
                             rate=self.SR, input=True, frames_per_buffer=self.CHUNK,
                             input_device_index=self.dev) as self.stream:
@@ -107,60 +177,81 @@ class NoiseDetector:
             noise_buf = []
             stt_buf = []
             
-            self.logger.info("Listening…")
-            last_noise_print = time.time()     # wall-clock timer (extra safety)
+            calibration_start_time = time.time()
+            max_calibration_samples = int(self.CALIBRATION_WINDOW / self.NOISE_TRACK_SEC)
+            
+            if self.auto_calibrate:
+                self.logger.info(f"Starting {self.CALIBRATION_WINDOW}s calibration period. "
+                               "Please ensure the environment is relatively quiet...")
+            else:
+                self.is_calibrated = True
+                self.calibration_complete = True
+                self.logger.info("Listening (no calibration)…")
+            
+            last_noise_print = time.time()
+            
             while True:
                 frame = self.q.get()
-                if not frame: continue  # skip empty frames
+                if not frame: continue
                 noise_buf.append(frame)
                 stt_buf.append(frame)
+                
                 # ── Noise tracking ──
                 if len(noise_buf) >= noise_hop_frames:
                     block = b"".join(noise_buf)
                     noise_buf.clear()
                     s = np.frombuffer(block, np.int16)
-                    if s.size % self.CH: s = s[:-(s.size % self.CH)]
+                    if s.size % self.CH: 
+                        s = s[:-(s.size % self.CH)]
                     s = s.reshape(-1, self.CH)
 
-                    # Normalize 16-bit signed int to float32 [-1, 1]
-                    s = s.astype(np.float32) / 32768.0
-
-                    # Average the two channels to mono (ambient noise)
-                    mono_audio = np.mean(s, axis=1)
-
-                    # Apply A-weighting filter
-                    weighted_frame = signal.lfilter(b, a, mono_audio)
-
-                    # Compute RMS of weighted frame
-                    rms = np.sqrt(np.mean(weighted_frame**2))
-
-                    # Convert to dB Sound Pressure Level (SPL) (approximate, uncalibrated)
-                    # Since input is normalized voltage, rms is relative;
-                    # without calibration, this is a relative dB value.
-                    # You can apply an offset if you determine calibration.
-                    db_spl = 20 * np.log10(rms / self.P0 + 1e-20)  # Added epsilon to avoid log(0)
-
+                    # Compute raw dB level
+                    db_spl_raw = self._compute_rms_db(s, b, a)
+                    
+                    # Calibration phase
+                    if self.auto_calibrate and not self.calibration_complete:
+                        self.calibration_samples.append(db_spl_raw)
+                        elapsed = time.time() - calibration_start_time
+                        remaining = max(0, self.CALIBRATION_WINDOW - elapsed)
+                        
+                        if len(self.calibration_samples) % 3 == 0:  # Update every 9 seconds
+                            self.logger.info(f"Calibrating... {remaining:.1f}s remaining "
+                                           f"(current raw level: {db_spl_raw:.2f} dB)")
+                        
+                        if len(self.calibration_samples) >= max_calibration_samples:
+                            self._calibrate()
+                        continue
+                    
+                    # Apply calibration offset
+                    db_spl = db_spl_raw + self.calibration_offset
+                    
+                    # Ensure minimum bound
+                    db_spl = max(db_spl, self.MIN_DB_SPL)
+                    
                     timestamp = datetime.now(timezone.utc)
                     if self.noise_callback:
                         self.noise_callback(timestamp, db_spl)
 
                     local_time = timestamp.astimezone().strftime('%d/%m/%Y, %H:%M:%S')
                     print(f"Timestamp: {local_time}, "
-                        f"A-weighted ambient noise level: {db_spl:.2f} dB SPL", flush=True)
-                # (optional failsafe: also fire if >NOISE_TRACK_SEC wall-clock seconds
-                # have elapsed even though buf is shorter – protects against dropouts)
-                if time.time() - last_noise_print > self.NOISE_TRACK_SEC * 1.2:
-                    noise_buf.clear()  # discard partial buffer
+                          f"A-weighted ambient noise level: {db_spl:.2f} dB SPL", flush=True)
+                    
                     last_noise_print = time.time()
-                # ── Speech-to-Text ──
-                if len(stt_buf) >= stt_hop_frames:
+                
+                # Failsafe for noise tracking
+                if time.time() - last_noise_print > self.NOISE_TRACK_SEC * 1.2:
+                    noise_buf.clear()
+                    last_noise_print = time.time()
+                
+                # ── Speech-to-Text (only after calibration) ──
+                if self.calibration_complete and len(stt_buf) >= stt_hop_frames:
                     stt_block = b"".join(stt_buf)
                     stt_buf.clear()
                     s = np.frombuffer(stt_block, np.int16)
-                    if s.size % self.CH: s = s[:-(s.size % self.CH)]
+                    if s.size % self.CH: 
+                        s = s[:-(s.size % self.CH)]
                     s = s.reshape(-1, self.CH)
-                    # Use always the first channel
-                    # ── Speech-to-Text ──
+                    
                     mono = s[:, self.sel].tobytes()
                     try:
                         txt = self.rec.recognize_google(sr.AudioData(mono, self.SR, 2),
@@ -179,4 +270,5 @@ class NoiseDetector:
 
 # ── entrypoint ──
 if __name__ == "__main__":
-    NoiseDetector().run()
+    detector = NoiseDetector(auto_calibrate=True)
+    detector.run()
