@@ -32,26 +32,36 @@ class NoiseDetector:
     STT_WINDOW_SEC  = 5
     HYST_DB         = 3
 
-    # ── Noise floor target ─────────────────────────────────────────────── #
-    MIN_DB_SPL = 20.0        # Target dB SPL displayed during true silence
+    # ── Noise floor targets ────────────────────────────────────────────── #
+    MIN_DB_SPL        = 20.0   # Target dB SPL displayed during true silence
+    MIC_SELF_NOISE_DB = 15.0   # ReSpeaker Lite hardware noise floor (dB SPL)
 
-    # ── Fast EMA (display smoothing) ───────────────────────────────────── #
+    # ── Sub-frame analysis ─────────────────────────────────────────────── #
+    # Each 3-second block is split into 100 ms sub-frames (≈ 30 per block).
+    # Per-block percentile descriptors replace the single-block RMS:
+    #   LAeq   – energy average (true equivalent continuous level)
+    #   LA90   – 90th-percentile level  → ambient / background noise
+    #   LA10   – 10th-percentile level  → intrusive / event noise
+    #   LApeak – max sub-frame level    → impulse indicator
+    # LA90 is inherently transient-resistant and drives the adaptive baseline.
+    SUB_FRAME_MS = 100
+
+    # ── Fast EMA (display smoothing of LAeq) ──────────────────────────── #
     # α = 0.15  →  τ ≈ (1/α − 1) × NOISE_TRACK_SEC ≈ 17 s
-    # Smooths frame-to-frame variation while reacting quickly to real changes.
     FAST_EMA_ALPHA = 0.15
 
-    # ── Slow EMA (adaptive baseline) ──────────────────────────────────── #
-    # α = 0.003 → τ ≈ (1/α − 1) × NOISE_TRACK_SEC ≈ 16 min
-    # Continuously tracks the quiet floor so MIN_DB_SPL always maps onto it.
-    # Only updated on non-transient frames — sudden loud events cannot
-    # permanently raise the baseline.
-    BASELINE_EMA_ALPHA = 0.003
+    # ── Slow EMA (adaptive baseline driven by LA90) ────────────────────── #
+    # α = 0.0004 → τ ≈ (1/α − 1) × NOISE_TRACK_SEC ≈ 2.1 h  (upward drift)
+    # Downward movement uses 3× alpha → τ ≈ 42 min (quiet-floor tracking).
+    # The 2-hour upward τ prevents overnight quiet from accumulating an offset
+    # that would artificially inflate readings when morning activity resumes.
+    BASELINE_EMA_ALPHA = 0.0004
 
-    # ── Transient (spike) gate ─────────────────────────────────────────── #
-    # Frame is a transient if:  raw_dB > 25th-percentile(recent) + threshold
-    # Transients are excluded from baseline updates and damped in the EMA.
-    SPIKE_THRESHOLD_DB = 8.0
-    TRANSIENT_WINDOW   = 30      # ring-buffer length (~90 s of raw readings)
+    # ── Adaptive transient gate ────────────────────────────────────────── #
+    # Reading is a transient if:  la90 > 25th-pctile(recent) + adapt_thresh
+    # adapt_thresh = clip(2.5 × local_std, 4.0, 15.0) dB
+    # Self-calibrates to the variability of the current environment.
+    TRANSIENT_WINDOW = 30      # ring-buffer length (~90 s of LA90 readings)
 
     # ── Change detection ──────────────────────────────────────────────── #
     # Compare mean of last 3 display readings against mean of older half.
@@ -98,7 +108,12 @@ class NoiseDetector:
 
     # ── public API ────────────────────────────────────────────────────── #
     def set_noise_callback(self, callback):
-        """Called with (datetime, display_db) after each noise block."""
+        """Called with (datetime, noise_level_db: float) after each noise block.
+
+        noise_level_db is the calibrated LA90 — the 90th-percentile sub-frame
+        level, which represents the ambient / background noise floor.
+        Values at or below ~20 dB SPL indicate a very quiet environment.
+        """
         self.noise_callback = callback
 
     def set_stt_callback(self, callback):
@@ -148,90 +163,127 @@ class NoiseDetector:
             self.q.put(self.stream.read(self.CHUNK, exception_on_overflow=False))
 
     # ── DSP ───────────────────────────────────────────────────────────── #
-    def _compute_rms_db(self, audio_data, b, a):
+    def _compute_sub_frame_levels(self, audio_data: np.ndarray, b, a) -> dict:
         """
-        Compute A-weighted RMS in nominal dB SPL (raw, before baseline offset).
-        Filter state is maintained across blocks so there are no discontinuities
-        at block boundaries.
+        A-weight the block then split it into SUB_FRAME_MS sub-frames.
+
+        Returns a dict with four standard acoustic descriptors (nominal dB SPL,
+        before baseline offset), all computed from per-sub-frame RMS levels:
+
+            laeq   – energy-average level (equivalent continuous SPL)
+            la90   – 90th-percentile level  → ambient / background noise
+            la10   – 10th-percentile level  → intrusive / event noise
+            lapeak – maximum sub-frame level → impulse indicator
+
+        Filter state is maintained across blocks to avoid boundary glitches.
+        Falls back to a single-frame result when the block is shorter than one
+        sub-frame (e.g. during warm-up with very short windows).
         """
         audio_norm = audio_data.astype(np.float32) / 32768.0
         mono       = np.mean(audio_norm, axis=1)   # stereo → mono
 
         if self.filter_zi is None:
             self.filter_zi = signal.lfilter_zi(b, a) * mono[0]
-
         weighted, self.filter_zi = signal.lfilter(b, a, mono, zi=self.filter_zi)
 
-        rms   = max(np.sqrt(np.mean(weighted**2)), 1e-10)
-        db_fs = 20.0 * np.log10(rms)
-        return db_fs + 94.0   # nominal dBFS → dB SPL
+        sub_len    = int(self.SR * self.SUB_FRAME_MS / 1000)   # samples per sub-frame
+        n_complete = len(weighted) // sub_len
 
-    def _update_adaptive_baseline(self, raw_db: float):
+        if n_complete == 0:
+            # Block shorter than one sub-frame — degenerate single-value result
+            rms = max(np.sqrt(np.mean(weighted ** 2)), 1e-10)
+            db  = 20.0 * np.log10(rms) + 94.0
+            return {"laeq": db, "la90": db, "la10": db, "lapeak": db}
+
+        frames        = weighted[: n_complete * sub_len].reshape(n_complete, sub_len)
+        rms_per_frame = np.maximum(np.sqrt(np.mean(frames ** 2, axis=1)), 1e-10)
+        db_per_frame  = 20.0 * np.log10(rms_per_frame) + 94.0   # nominal dB SPL
+
+        # LAeq — energy average of sub-frames (not arithmetic mean of dB values)
+        laeq = 20.0 * np.log10(max(np.sqrt(np.mean(rms_per_frame ** 2)), 1e-10)) + 94.0
+
+        return {
+            "laeq":   float(laeq),
+            "la90":   float(np.percentile(db_per_frame, 90)),
+            "la10":   float(np.percentile(db_per_frame, 10)),
+            "lapeak": float(np.max(db_per_frame)),
+        }
+
+    def _update_adaptive_baseline(self, la90: float):
         """
-        Update the adaptive quiet-floor baseline and return the calibrated dB.
+        Update the adaptive quiet-floor baseline using LA90 as the input signal.
 
-        Transient detection
-        -------------------
-        A frame is a transient if its raw dB exceeds the 25th percentile of
-        the recent ring buffer by more than SPIKE_THRESHOLD_DB.  The percentile
-        acts as a robust estimate of the current calm level, so a brief loud
-        event does not gate itself (the percentile barely moves on one frame).
+        Using LA90 (the 90th-percentile sub-frame level) instead of the raw
+        block RMS makes the baseline inherently transient-resistant: a brief
+        loud event moves only a few sub-frames, barely shifting LA90.
+
+        Adaptive transient gate
+        -----------------------
+        A reading is flagged as a transient if LA90 exceeds the 25th percentile
+        of the recent ring buffer by more than ``clip(2.5 × local_std, 4, 15)``
+        dB.  The threshold self-calibrates to the variability of the current
+        environment instead of using a fixed 8 dB offset.  Requires at least
+        10 readings in the ring buffer before gating begins.
 
         Baseline EMA
         ------------
-        Very slow α so the baseline reflects hours of environment, not
-        individual noisy moments.  Downward movement (quieter environment)
-        uses 3× alpha for faster floor tracking — e.g. when the house goes
-        quiet at night the floor adjusts within a few minutes rather than hours.
-        Upward drift is intentionally slow so daytime noise cannot inflate the
-        nighttime reference in a single session.
+        Upward  α = 0.0004 → τ ≈ 2.1 h  prevents overnight quiet accumulating
+        a large offset that would over-inflate morning readings.
+        Downward α = 0.0012 → τ ≈ 42 min tracks a genuinely quieter floor
+        quickly (e.g. house going quiet in the evening).
 
         Dynamic offset
         --------------
         offset = MIN_DB_SPL − baseline
-        Applied to every reading so the quiet floor always displays as 20 dB.
+        Applied uniformly to all four metrics so the quiet floor always maps to
+        ≈ MIN_DB_SPL in the calibrated space.
 
-        Returns (is_transient: bool, calibrated_db: float).
+        Returns (is_transient: bool, dynamic_offset: float).
         """
-        self.recent_raw.append(raw_db)
+        self.recent_raw.append(la90)
 
         is_transient = False
-        if len(self.recent_raw) >= 5:
-            calm_ref     = float(np.percentile(list(self.recent_raw), 25))
-            is_transient = raw_db > calm_ref + self.SPIKE_THRESHOLD_DB
+        if len(self.recent_raw) >= 10:
+            recent_list  = list(self.recent_raw)
+            calm_ref     = float(np.percentile(recent_list, 25))
+            local_std    = float(np.std(recent_list[-20:]))
+            adapt_thresh = float(np.clip(2.5 * local_std, 4.0, 15.0))
+            is_transient = la90 > calm_ref + adapt_thresh
 
         if self.adaptive_baseline is None:
-            self.adaptive_baseline = raw_db
+            self.adaptive_baseline = la90
         elif not is_transient:
             alpha = self.BASELINE_EMA_ALPHA
-            if raw_db < self.adaptive_baseline:
+            if la90 < self.adaptive_baseline:
                 alpha *= 3.0          # track quiet floor faster
             self.adaptive_baseline = (
-                alpha * raw_db + (1.0 - alpha) * self.adaptive_baseline
+                alpha * la90 + (1.0 - alpha) * self.adaptive_baseline
             )
 
         self.dynamic_offset = self.MIN_DB_SPL - self.adaptive_baseline
-        return is_transient, raw_db + self.dynamic_offset
+        return is_transient, self.dynamic_offset
 
-    def _smooth_output(self, calibrated_db: float, is_transient: bool) -> float:
+    def _smooth_output(self, calibrated_laeq: float) -> float:
         """
-        Fast EMA smoothing of the calibrated reading.
+        Fast EMA smoothing of calibrated LAeq for the display value.
 
-        Transient frames use 0.3× alpha so brief spikes are still visible
-        in the output (they represent real acoustic events) but are heavily
-        damped — they will not dominate the reading for more than a few seconds.
+        Transient damping is no longer applied here — LA90 driving the
+        adaptive baseline already makes the calibration offset immune to brief
+        spikes.  Transient peak information is preserved separately in LApeak
+        rather than being suppressed or blended into the display reading.
 
-        A hard floor at 95 % of MIN_DB_SPL (≈ 19 dB) prevents the display
-        from ever dropping into physically implausible territory.
+        The hard floor is the ReSpeaker Lite hardware self-noise (MIC_SELF_NOISE_DB
+        = 15 dB SPL), replacing the previous MIN_DB_SPL × 0.95 = 19 dB clamp
+        that caused 80 % floor saturation in quiet environments.
         """
-        alpha = self.FAST_EMA_ALPHA * (0.3 if is_transient else 1.0)
-
         if self.smoothed_db is None:
-            self.smoothed_db = calibrated_db
+            self.smoothed_db = calibrated_laeq
         else:
-            self.smoothed_db = alpha * calibrated_db + (1.0 - alpha) * self.smoothed_db
-
-        return max(self.smoothed_db, self.MIN_DB_SPL * 0.95)
+            self.smoothed_db = (
+                self.FAST_EMA_ALPHA * calibrated_laeq
+                + (1.0 - self.FAST_EMA_ALPHA) * self.smoothed_db
+            )
+        return max(self.smoothed_db, self.MIC_SELF_NOISE_DB)
 
     def _detect_trend(self, display_db: float) -> str:
         """
@@ -312,47 +364,52 @@ class NoiseDetector:
                         s = s[:-(s.size % self.CH)]
                     s = s.reshape(-1, self.CH)
 
-                    # Step 1 — raw A-weighted dB
-                    raw_db = self._compute_rms_db(s, b, a)
+                    # Step 1 — sub-frame A-weighted analysis → {laeq,la90,la10,lapeak}
+                    metrics = self._compute_sub_frame_levels(s, b, a)
 
-                    # Step 2 — adaptive baseline update + transient detection
-                    is_transient, calibrated_db = self._update_adaptive_baseline(raw_db)
+                    # Step 2 — adaptive baseline update (driven by LA90)
+                    is_transient, offset = self._update_adaptive_baseline(metrics["la90"])
 
                     # Step 3 — warm-up: seed baseline silently, hold output
                     self._warmup_count += 1
                     if self._warmup_count <= self.WARMUP_BLOCKS:
                         self.logger.debug(
                             f"Warm-up {self._warmup_count}/{self.WARMUP_BLOCKS}  "
-                            f"raw={raw_db:.1f} dB  "
+                            f"la90={metrics['la90']:.1f} dB  "
                             f"baseline={self.adaptive_baseline:.1f} dB"
                         )
                         last_noise_ts = time.time()
                         continue
 
-                    # Step 4 — smooth output (damp transients, apply hard floor)
-                    display_db = self._smooth_output(calibrated_db, is_transient)
+                    # Step 4 — apply calibration offset uniformly to all four metrics
+                    cal = {k: v + offset for k, v in metrics.items()}
 
-                    # Step 5 — sliding-window change detection
-                    trend = self._detect_trend(display_db)
+                    # Step 5 — smooth calibrated LAeq for the display value
+                    cal["laeq"] = self._smooth_output(cal["laeq"])
 
-                    # Step 6 — emit to callback and console
+                    # Step 6 — sliding-window change detection on display LAeq
+                    trend = self._detect_trend(cal["laeq"])
+
+                    # Step 7 — emit to callback and console
                     timestamp  = datetime.now(timezone.utc)
                     local_time = timestamp.astimezone().strftime('%d/%m/%Y, %H:%M:%S')
                     flag       = " [transient]" if is_transient else ""
 
                     if self.noise_callback:
-                        self.noise_callback(timestamp, display_db)
+                        self.noise_callback(timestamp, cal["la90"])
 
                     self.logger.debug(
-                        f"{local_time}  raw={raw_db:.1f}  "
-                        f"cal={calibrated_db:.1f}  display={display_db:.1f} dB  "
+                        f"{local_time}  "
+                        f"laeq={cal['laeq']:.1f}  la90={cal['la90']:.1f}  "
+                        f"la10={cal['la10']:.1f}  lapeak={cal['lapeak']:.1f} dB  "
                         f"baseline={self.adaptive_baseline:.1f}  "
-                        f"offset={self.dynamic_offset:+.1f}  "
-                        f"trend={trend}{flag}"
+                        f"offset={offset:+.1f}  trend={trend}{flag}"
                     )
                     print(
                         f"Timestamp: {local_time}, "
-                        f"Display: {display_db:.2f} dB SPL, "
+                        f"LAeq: {cal['laeq']:.2f} dB SPL, "
+                        f"LA90: {cal['la90']:.2f}, "
+                        f"LApeak: {cal['lapeak']:.2f}, "
                         f"Trend: {trend}{flag}",
                         flush=True
                     )
