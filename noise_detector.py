@@ -63,6 +63,18 @@ class NoiseDetector:
     # Self-calibrates to the variability of the current environment.
     TRANSIENT_WINDOW = 30      # ring-buffer length (~90 s of LA90 readings)
 
+    # ── Offset guardrail ──────────────────────────────────────────────── #
+    # The dynamic offset is MIN_DB_SPL − baseline.  When the baseline drifts
+    # high during a noisy period (e.g. weekend evening at 26–28 dB) and then a
+    # genuinely quiet frame arrives at night (la90_raw ≈ 5 dB), the unclamped
+    # offset can produce a calibrated value of 5 − 6.9 = −1.9 dB — physically
+    # impossible and confirmed in the data (observed −2.89 dB, Jun 13 04:00).
+    # MAX_OFFSET_DB limits how far negative the offset is allowed to go.
+    # A cap of −10 dB means the worst-case calibrated floor before the
+    # MIC_SELF_NOISE_DB clamp is la90_raw − 10, which is still positive for
+    # any real signal above the mic noise floor.
+    MAX_OFFSET_DB = 10.0
+
     # ── Change detection ──────────────────────────────────────────────── #
     # Compare mean of last 3 display readings against mean of older half.
     # Hysteresis: trend reverts to "stable" only when |Δ| < threshold × 0.5.
@@ -260,7 +272,10 @@ class NoiseDetector:
                 alpha * la90 + (1.0 - alpha) * self.adaptive_baseline
             )
 
-        self.dynamic_offset = self.MIN_DB_SPL - self.adaptive_baseline
+        self.dynamic_offset = max(
+            self.MIN_DB_SPL - self.adaptive_baseline,
+            -self.MAX_OFFSET_DB
+        )
         return is_transient, self.dynamic_offset
 
     def _smooth_output(self, calibrated_laeq: float) -> float:
@@ -396,7 +411,7 @@ class NoiseDetector:
                     flag       = " [transient]" if is_transient else ""
 
                     if self.noise_callback:
-                        self.noise_callback(timestamp, cal["la90"])
+                        self.noise_callback(timestamp, max(cal["la90"], self.MIC_SELF_NOISE_DB))
 
                     self.logger.debug(
                         f"{local_time}  "
