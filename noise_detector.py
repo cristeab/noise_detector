@@ -33,8 +33,12 @@ class NoiseDetector:
     HYST_DB         = 3
 
     # ── Noise floor targets ────────────────────────────────────────────── #
-    MIN_DB_SPL        = 20.0   # Target dB SPL displayed during true silence
-    MIC_SELF_NOISE_DB = 15.0   # ReSpeaker Lite hardware noise floor (dB SPL)
+    MIN_DB_SPL        = 20.0   # Target dB SPL for true silence; bottom of very_quiet
+    # Set equal to MIN_DB_SPL so the emitted value never falls below the first
+    # interval boundary (0–25 dB "very_quiet").  Values < 20 dB are physically
+    # unreliable for the ReSpeaker Lite (~26–29 dB(A) self-noise) and would
+    # only arise from calibration overcorrection, not genuine measurements.
+    MIC_SELF_NOISE_DB = MIN_DB_SPL   # = 20.0 dB
 
     # ── Sub-frame analysis ─────────────────────────────────────────────── #
     # Each 3-second block is split into 100 ms sub-frames (≈ 30 per block).
@@ -80,6 +84,20 @@ class NoiseDetector:
     # Hysteresis: trend reverts to "stable" only when |Δ| < threshold × 0.5.
     CHANGE_DETECT_WINDOW = 15    # blocks (~45 s)
     CHANGE_THRESHOLD_DB  = 5.0   # dB
+
+    # ── Noise level classification intervals ──────────────────────────── #
+    # Mirrors the dashboard configuration exactly.  Each tuple is
+    # (min_db, max_db, name).  Boundaries are half-open [min, max).
+    NOISE_INTERVALS = [
+        (  0,  25, "very_quiet"),   # ideal for sleep and concentration
+        ( 25,  30, "quiet"),        # WHO bedroom nighttime standard
+        ( 30,  35, "normal"),       # WHO daytime living areas
+        ( 35,  45, "moderate"),     # acceptable background noise
+        ( 45,  55, "elevated"),     # WHO outdoor residential limit
+        ( 55,  65, "high"),         # may interfere with communication
+        ( 65,  75, "very_high"),    # potential sleep disruption
+        ( 75, 150, "excessive"),    # hearing damage risk
+    ]
 
     # ── Warm-up ───────────────────────────────────────────────────────── #
     # Seed the baseline for this many blocks before emitting data.
@@ -145,6 +163,19 @@ class NoiseDetector:
         self.logger.info("Baseline reset — re-seeding from next readings")
 
     # ── static helpers ────────────────────────────────────────────────── #
+    @staticmethod
+    def classify_interval(spl: float) -> str:
+        """Return the noise level interval name for a calibrated dB SPL value.
+
+        Boundaries are half-open [min, max) matching the dashboard config.
+        Values below the first boundary return "very_quiet"; values at or
+        above the last boundary (75 dB) return "excessive".
+        """
+        for lo, hi, name in NoiseDetector.NOISE_INTERVALS:
+            if lo <= spl < hi:
+                return name
+        return "excessive" if spl >= 75 else "very_quiet"
+
     @staticmethod
     def a_weighting(fs):
         """Design a digital A-weighting IIR filter for sample rate fs."""
@@ -409,22 +440,26 @@ class NoiseDetector:
                     timestamp  = datetime.now(timezone.utc)
                     local_time = timestamp.astimezone().strftime('%d/%m/%Y, %H:%M:%S')
                     flag       = " [transient]" if is_transient else ""
+                    emitted    = max(cal["la90"], self.MIC_SELF_NOISE_DB)
+                    level_name = self.classify_interval(emitted)
 
                     if self.noise_callback:
-                        self.noise_callback(timestamp, max(cal["la90"], self.MIC_SELF_NOISE_DB))
+                        self.noise_callback(timestamp, emitted)
 
                     self.logger.debug(
                         f"{local_time}  "
                         f"laeq={cal['laeq']:.1f}  la90={cal['la90']:.1f}  "
                         f"la10={cal['la10']:.1f}  lapeak={cal['lapeak']:.1f} dB  "
                         f"baseline={self.adaptive_baseline:.1f}  "
-                        f"offset={offset:+.1f}  trend={trend}{flag}"
+                        f"offset={offset:+.1f}  trend={trend}  "
+                        f"level={level_name}{flag}"
                     )
                     print(
                         f"Timestamp: {local_time}, "
                         f"LAeq: {cal['laeq']:.2f} dB SPL, "
-                        f"LA90: {cal['la90']:.2f}, "
+                        f"LA90: {emitted:.2f}, "
                         f"LApeak: {cal['lapeak']:.2f}, "
+                        f"Level: {level_name}, "
                         f"Trend: {trend}{flag}",
                         flush=True
                     )
