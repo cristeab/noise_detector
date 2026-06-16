@@ -245,10 +245,17 @@ class NoiseDetector:
         # LAeq — energy average of sub-frames (not arithmetic mean of dB values)
         laeq = 20.0 * np.log10(max(np.sqrt(np.mean(rms_per_frame ** 2)), 1e-10)) + 94.0
 
+        # ── Acoustic percentile convention ─────────────────────────────────
+        # LN = the level EXCEEDED N% of the time (ISO 1996 / IEC 61672).
+        # Sorting sub-frames in ascending order:
+        #   LA90 = background / quiet floor → exceeded 90% = 10th percentile
+        #   LA10 = intrusive / event level  → exceeded 10% = 90th percentile
+        # np.percentile(x, 10) gives the value below which 10% of frames lie,
+        # i.e. 90% of frames exceed it — this IS the acoustic LA90 definition.
         return {
             "laeq":   float(laeq),
-            "la90":   float(np.percentile(db_per_frame, 90)),
-            "la10":   float(np.percentile(db_per_frame, 10)),
+            "la90":   float(np.percentile(db_per_frame, 10)),  # background floor
+            "la10":   float(np.percentile(db_per_frame, 90)),  # event / intrusive level
             "lapeak": float(np.max(db_per_frame)),
         }
 
@@ -256,9 +263,10 @@ class NoiseDetector:
         """
         Update the adaptive quiet-floor baseline using LA90 as the input signal.
 
-        Using LA90 (the 90th-percentile sub-frame level) instead of the raw
-        block RMS makes the baseline inherently transient-resistant: a brief
-        loud event moves only a few sub-frames, barely shifting LA90.
+        Using LA90 (the level exceeded 90% of the time = 10th percentile of
+        sub-frame levels) instead of the raw block RMS makes the baseline
+        inherently transient-resistant: a brief loud event raises only the top
+        few sub-frames, leaving the 10th percentile nearly unchanged.
 
         Adaptive transient gate
         -----------------------
