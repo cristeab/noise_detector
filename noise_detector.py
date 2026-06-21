@@ -104,6 +104,35 @@ class NoiseDetector:
     # WARMUP_BLOCKS × NOISE_TRACK_SEC = 15 s
     WARMUP_BLOCKS = 5
 
+    # ── Quiet-hours awareness ──────────────────────────────────────────── #
+    # Ground truth for this deployment: the monitored room is expected to be
+    # silent every night between 23:50 and 06:00 *local* time. The adaptive
+    # baseline above has no notion of time-of-day, so a sustained-but-real
+    # noise source that switches on overnight (e.g. a cooling fan, an
+    # appliance compressor cycle) looks identical to "the room got a bit
+    # louder" and gets absorbed into the baseline as the new normal instead
+    # of being surfaced as unexpected. The mechanism below learns what true
+    # nighttime silence looks like in *this* room across many nights and
+    # raises a distinct, debounced flag when a quiet-hours reading drifts
+    # far above that learned floor for a sustained period.
+    QUIET_HOURS_START = (23, 50)   # local time (hour, minute), inclusive
+    QUIET_HOURS_END    = (6, 0)    # local time (hour, minute), exclusive
+
+    # Asymmetric envelope tracker for the learned "true silence" floor.
+    # Falling readings pull the reference down quickly — a quieter night is
+    # immediately trusted. Rising readings pull it up only very slowly, so a
+    # single noisy night can't retrain what "silence" means here.
+    NIGHT_REF_ALPHA_DOWN = 0.02     # tau ≈  50 readings ≈  2.5 min
+    NIGHT_REF_ALPHA_UP   = 0.0008   # tau ≈ 1250 readings ≈ 62 min
+
+    # A quiet-hours reading counts as an anomaly once it stays more than
+    # NIGHT_ANOMALY_MARGIN_DB above the learned floor for at least
+    # NIGHT_ANOMALY_MIN_SEC — long enough to rule out a one-off transient
+    # (already discounted upstream by the main transient gate) and instead
+    # catch something that switched on and stayed on.
+    NIGHT_ANOMALY_MARGIN_DB = 8.0
+    NIGHT_ANOMALY_MIN_SEC   = 5 * 60
+
     def __init__(self, logger=None, mic="ReSpeaker", auto_calibrate=True):
         if logger is None:
             logging.basicConfig(level=logging.INFO)
@@ -136,6 +165,16 @@ class NoiseDetector:
         self.noise_trend    = "stable"  # "stable" | "increasing" | "decreasing"
         self._warmup_count  = 0
 
+        # ── Quiet-hours / night-reference state ─────────────────────────── #
+        self.night_reference      = None   # learned true-silence floor (dB)
+        self._night_excursion_start = None # time.time() when current excursion above the floor began
+        self.is_night_anomaly     = False
+
+        # Diagnostics for the most recently emitted block — exposed as a plain
+        # attribute (rather than a callback argument) so set_noise_callback's
+        # signature stays unchanged. See set_noise_callback docstring.
+        self.last_diagnostics = None
+
     # ── public API ────────────────────────────────────────────────────── #
     def set_noise_callback(self, callback):
         """Called with (datetime, noise_level_db: float) after each noise block.
@@ -143,6 +182,11 @@ class NoiseDetector:
         noise_level_db is the calibrated LA90 — the 90th-percentile sub-frame
         level, which represents the ambient / background noise floor.
         Values at or below ~20 dB SPL indicate a very quiet environment.
+
+        Extra diagnostics for this same block (la90_raw, baseline, offset,
+        is_transient, in_quiet_hours, night_reference, is_night_anomaly) are
+        available right after the callback returns via self.last_diagnostics,
+        without changing this callback's signature.
         """
         self.noise_callback = callback
 
@@ -160,6 +204,10 @@ class NoiseDetector:
         self.noise_trend   = "stable"
         self._warmup_count = 0
         self.filter_zi     = None
+        self.night_reference        = None
+        self._night_excursion_start = None
+        self.is_night_anomaly       = False
+        self.last_diagnostics       = None
         self.logger.info("Baseline reset — re-seeding from next readings")
 
     # ── static helpers ────────────────────────────────────────────────── #
@@ -175,6 +223,20 @@ class NoiseDetector:
             if lo <= spl < hi:
                 return name
         return "excessive" if spl >= 75 else "very_quiet"
+
+    @staticmethod
+    def _in_quiet_hours(local_dt) -> bool:
+        """True if local_dt falls inside the configured nightly quiet window
+        (QUIET_HOURS_START .. QUIET_HOURS_END), correctly handling the wrap
+        across midnight, e.g. 23:50 -> 06:00."""
+        start_h, start_m = NoiseDetector.QUIET_HOURS_START
+        end_h,   end_m   = NoiseDetector.QUIET_HOURS_END
+        start = start_h * 60 + start_m
+        end   = end_h * 60 + end_m
+        now   = local_dt.hour * 60 + local_dt.minute
+        if start <= end:
+            return start <= now < end
+        return now >= start or now < end   # window crosses midnight
 
     @staticmethod
     def a_weighting(fs):
@@ -381,6 +443,61 @@ class NoiseDetector:
 
         return self.noise_trend
 
+    def _update_night_reference(self, emitted_db: float, in_quiet_hours: bool) -> bool:
+        """
+        Maintain a learned "true silence" reference for the configured quiet
+        hours and flag sustained excursions above it.
+
+        Unlike the general adaptive baseline (which deliberately treats any
+        sustained, non-transient level as "the new normal"), this tracker
+        only ever adapts while things look genuinely quiet — a sustained rise
+        during quiet hours is held back from the reference and instead raised
+        as an anomaly, since by definition the room should be silent here.
+
+        Returns True if the current reading is part of an ongoing, sustained
+        nighttime noise anomaly (see NIGHT_ANOMALY_MIN_SEC).
+        """
+        if not in_quiet_hours:
+            # Outside quiet hours there is nothing to learn or flag; reset so
+            # the next quiet window always starts the excursion timer clean.
+            self._night_excursion_start = None
+            self.is_night_anomaly = False
+            return False
+
+        if self.night_reference is None:
+            self.night_reference = emitted_db
+            return False
+
+        above = emitted_db - self.night_reference
+
+        if above > self.NIGHT_ANOMALY_MARGIN_DB:
+            now = time.time()
+            if self._night_excursion_start is None:
+                self._night_excursion_start = now
+            sustained = (now - self._night_excursion_start) >= self.NIGHT_ANOMALY_MIN_SEC
+            if sustained and not self.is_night_anomaly:
+                self.logger.warning(
+                    f"Night anomaly: {emitted_db:.1f} dB sustained "
+                    f"{self.NIGHT_ANOMALY_MIN_SEC}s+ above the learned "
+                    f"quiet-hours floor of {self.night_reference:.1f} dB"
+                )
+            self.is_night_anomaly = sustained
+        else:
+            self._night_excursion_start = None
+            if self.is_night_anomaly:
+                self.logger.info(
+                    f"Night anomaly cleared: {emitted_db:.1f} dB back near "
+                    f"the quiet-hours floor of {self.night_reference:.1f} dB"
+                )
+            self.is_night_anomaly = False
+            alpha = (self.NIGHT_REF_ALPHA_DOWN if emitted_db < self.night_reference
+                     else self.NIGHT_REF_ALPHA_UP)
+            self.night_reference = (
+                alpha * emitted_db + (1.0 - alpha) * self.night_reference
+            )
+
+        return self.is_night_anomaly
+
     # ── main loop ─────────────────────────────────────────────────────── #
     def run(self):
         b, a = NoiseDetector.a_weighting(self.SR)
@@ -446,10 +563,29 @@ class NoiseDetector:
 
                     # Step 7 — emit to callback and console
                     timestamp  = datetime.now(timezone.utc)
-                    local_time = timestamp.astimezone().strftime('%d/%m/%Y, %H:%M:%S')
+                    local_dt   = timestamp.astimezone()
+                    local_time = local_dt.strftime('%d/%m/%Y, %H:%M:%S')
                     flag       = " [transient]" if is_transient else ""
                     emitted    = max(cal["la90"], self.MIC_SELF_NOISE_DB)
                     level_name = self.classify_interval(emitted)
+
+                    # Step 8 — quiet-hours reference tracking / anomaly flag
+                    in_quiet_hours   = self._in_quiet_hours(local_dt)
+                    is_night_anomaly = self._update_night_reference(emitted, in_quiet_hours)
+                    night_flag       = " [NIGHT-ANOMALY]" if is_night_anomaly else ""
+
+                    diagnostics = {
+                        "la90_raw":         metrics["la90"],
+                        "baseline":         self.adaptive_baseline,
+                        "offset":           offset,
+                        "is_transient":     is_transient,
+                        "in_quiet_hours":   in_quiet_hours,
+                        "night_reference":  self.night_reference,
+                        "is_night_anomaly": is_night_anomaly,
+                    }
+                    # Exposed as an attribute (not a callback argument) so
+                    # set_noise_callback's signature stays unchanged.
+                    self.last_diagnostics = diagnostics
 
                     if self.noise_callback:
                         self.noise_callback(timestamp, emitted)
@@ -460,7 +596,7 @@ class NoiseDetector:
                         f"la10={cal['la10']:.1f}  lapeak={cal['lapeak']:.1f} dB  "
                         f"baseline={self.adaptive_baseline:.1f}  "
                         f"offset={offset:+.1f}  trend={trend}  "
-                        f"level={level_name}{flag}"
+                        f"level={level_name}{flag}{night_flag}"
                     )
                     print(
                         f"Timestamp: {local_time}, "
@@ -468,7 +604,7 @@ class NoiseDetector:
                         f"LA90: {emitted:.2f}, "
                         f"LApeak: {cal['lapeak']:.2f}, "
                         f"Level: {level_name}, "
-                        f"Trend: {trend}{flag}",
+                        f"Trend: {trend}{flag}{night_flag}",
                         flush=True
                     )
                     last_noise_ts = time.time()
